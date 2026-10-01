@@ -22,7 +22,7 @@
 
 <br/>
 
-**[Architecture](#-architecture)** · **[Why these choices](#-why-i-chose-what-i-chose)** · **[Pipeline](#-cicd-pipeline)** · **[Security](#-security)** · **[Monitoring](#-monitoring--alerting)** · **[Backups](#-backups--disaster-recovery)** · **[Cost](#-cost)** · **[Production](#-how-this-changes-for-real-production)**
+**[Architecture](#-architecture)** · **[Why these choices](#-why-i-chose-what-i-chose)** · **[Pipeline](#-cicd-pipeline)** · **[Rollback](#rollback)** · **[Prod](#prod)** · **[Security](#-security)** · **[Monitoring](#-monitoring--alerting)** · **[Backups](#-backups--disaster-recovery)** · **[Cost](#-cost)** · **[Problems solved](#problems)** · **[Verified](#verified)** · **[Production](#-how-this-changes-for-real-production)**
 
 </div>
 
@@ -103,6 +103,7 @@ How each requirement in the brief maps to this repository:
 | ➕ | *Bonus:* AWS Backup, DR copy, vault lock, **restore drill** | [`modules/backup`](infra/modules/backup), [`restore-drill.sh`](scripts/restore-drill.sh) | ⭐ |
 | ➕ | *Bonus:* smoke test + **automatic rollback**, manual prod gate | `verify` / `rollback` / `promote` stages | ⭐ |
 | ➕ | *Bonus:* public image on Docker Hub | `moes98/test2026` | ⭐ |
+| ➕ | *Bonus:* troubleshooting log + live verification | [Problems solved](#problems), [Verified](#verified) | ⭐ |
 
 ---
 
@@ -324,26 +325,361 @@ flowchart LR
     V -- "manual ✅" --> PR["⑩ promote prod<br/>same image"]
 ```
 
-| Stage | Jobs | Runs on | Gate |
+The pipeline has **10 stages and 16 jobs**. Every stage only starts when the previous one passed, so a problem
+is caught at the **cheapest possible point**: a formatting error fails in about 10 seconds, long before anything
+touches AWS.
+
+### When does what run?
+
+| Trigger | Stages that run | AWS credentials available |
+|---|---|---|
+| **Merge request** (any branch) | ① lint → ② test → ③ build → ④ scan → ⑥ plan | **Read-only** plan key only |
+| **Push / merge to `main`** | all 10 stages | Plan key + **deploy key** (protected variable) |
+| **Any other branch push** | nothing (`workflow:rules`) | none |
+
+A merge request can **look** at AWS (to produce a plan) but can **never change** it. The deploy key is a
+GitLab *protected* variable, which GitLab only injects into pipelines running on the protected `main` branch,
+even if someone edits `.gitlab-ci.yml` in their branch.
+
+### Pipeline-wide safety settings
+
+| Setting | Effect |
+|---|---|
+| `interruptible: true` (default) | A newer push cancels an older, now-pointless pipeline. Deploy jobs set `interruptible: false` so a deploy is **never killed halfway**. |
+| `resource_group: tf-dev` / `tf-prod` | Only **one** pipeline at a time can plan or apply an environment. No two `terraform apply` runs can race on the same state. |
+| `needs:` | Jobs start as soon as *their* inputs are ready, not when the whole previous stage is done. |
+| Pinned tool versions | Terraform `1.16`, ruff `0.16.9`, `docker:28`. The same commit always lints the same way. |
+
+---
+
+### ① `lint`: catch problems before running anything
+
+Six independent jobs run in parallel. None needs AWS credentials, and together they take about 1 minute.
+
+<details open>
+<summary><b><code>lint:python</code>, ruff (≈10 s)</b></summary>
+
+```bash
+ruff check .            # lint: bugs, bad patterns, insecure calls
+ruff format --check .   # formatting: fails if any file WOULD be reformatted (changes nothing)
+```
+
+Rules enabled in [`pyproject.toml`](app/backend/pyproject.toml): `select = ["E","F","I","B","UP","S"]`
+
+| Code | Rule set | Example of what it catches |
+|---|---|---|
+| `E` | pycodestyle | style errors, lines over 100 characters |
+| `F` | pyflakes | unused imports, undefined names (real bugs) |
+| `I` | isort | imports in the wrong order |
+| `B` | flake8-bugbear | likely bugs, e.g. a mutable default argument `def f(x=[])` |
+| `UP` | pyupgrade | outdated syntax. It flagged `timezone.utc` → `datetime.UTC` during this build. |
+| `S` | bandit (security) | `eval()`, hard-coded passwords, `subprocess(shell=True)`, insecure temp files |
+
+Deliberate exceptions: `S101` (`assert`) is allowed in `tests/`, and `B008` is ignored because `Depends()` in
+default arguments is normal FastAPI style. **Why ruff:** one Rust tool replaces flake8, isort, pyupgrade,
+bandit and black, and it's 10–100× faster.
+
+</details>
+
+<details>
+<summary><b><code>lint:dockerfile</code>, hadolint (≈6 s)</b></summary>
+
+```bash
+hadolint --failure-threshold warning app/backend/Dockerfile app/frontend/Dockerfile
+```
+
+hadolint parses each Dockerfile into an AST and checks it against Docker best practices, and it runs
+**ShellCheck on every `RUN` line**. `--failure-threshold warning` means **warnings fail the job too**, not just
+errors.
+
+| Rule | Catches |
+|---|---|
+| DL3002 | last `USER` is root |
+| DL3006 / DL3007 | untagged base image or `:latest` (not reproducible) |
+| DL3008 / DL3018 | `apt-get` / `apk add` without pinned versions |
+| DL3009 | apt lists not cleaned (bigger image) |
+| DL3025 | `CMD` in shell form (PID 1 doesn't receive `SIGTERM`, so containers don't stop cleanly) |
+| DL4006 | pipes without `set -o pipefail` (hidden failures) |
+| SC2086 | unquoted shell variables |
+
+</details>
+
+<details>
+<summary><b><code>lint:terraform</code>, fmt + validate (≈70 s)</b></summary>
+
+```bash
+terraform fmt -check -recursive -diff infra
+for d in infra/bootstrap infra/stack; do
+  (cd $d && terraform init -backend=false && terraform validate)
+done
+```
+
+| Step | What it proves |
+|---|---|
+| `fmt -check -recursive -diff` | every `.tf` file uses canonical formatting. `-diff` prints exactly what's wrong. |
+| `init -backend=false` | downloads providers and modules **without connecting to the S3 state**, so it needs no credentials and can't touch real infrastructure |
+| `validate` | the configuration is **internally consistent**: valid syntax, every reference exists (`module.network.vpc_id`), argument names and types are right, required module inputs are passed |
+
+It runs on **both root modules**. Validating `stack` also validates all 8 child modules through it.
+
+</details>
+
+<details>
+<summary><b><code>lint:tflint</code>, deeper Terraform linting (≈12 s)</b></summary>
+
+```bash
+tflint --init && tflint --recursive --config infra/.tflint.hcl
+```
+
+`validate` checks that the code is *well-formed*. tflint checks that it's **sensible**. Two plugins are configured
+in [`infra/.tflint.hcl`](infra/.tflint.hcl):
+
+**Terraform ruleset (`recommended` preset + extras):**
+
+| Rule | Catches |
+|---|---|
+| `terraform_unused_declarations` | dead variables, locals or data sources. It caught an unused `aws_caller_identity` in the backup module during this build. |
+| `terraform_documented_variables` / `_outputs` | every variable and output **must** have a `description`, so the modules document themselves |
+| `terraform_naming_convention` | `snake_case` names everywhere |
+| `terraform_required_providers` / `_version` | every module pins its provider and Terraform versions |
+| `terraform_deprecated_syntax` | legacy `"${var.x}"` interpolation |
+
+**AWS ruleset (`tflint-ruleset-aws` 0.40):** knows AWS's real valid values, so it catches errors that would
+otherwise only show up at `apply` time: invalid instance classes, nonexistent engine versions, bad region or AZ
+names, deprecated arguments.
+
+</details>
+
+<details>
+<summary><b><code>security:checkov</code>, infrastructure security scan (≈15 s)</b></summary>
+
+```bash
+checkov -d infra --config-file infra/.checkov.yaml -o cli -o junitxml
+```
+
+Checkov evaluates the Terraform against 1,000+ policies (CIS AWS benchmark and AWS best practice). Results are
+also published as a **JUnit report**, so they appear in GitLab's *Tests* tab.
+
+**Result: 279 passed · 0 failed.** The first scan of this code showed **43 failures**. The real gaps were fixed
+(ALB deletion protection, explicit key policies on the backup KMS keys, cleanup of incomplete S3 multipart
+uploads, IAM database authentication, explicit WAF rules), and every remaining exception is listed with a
+written reason in [`infra/.checkov.yaml`](infra/.checkov.yaml), in three groups:
+
+| Group | Example |
+|---|---|
+| **Design decision** | ALB listener is HTTP: it's *internal* and only reachable through the CloudFront VPC origin. CI uses IAM users: the GitLab is private, so OIDC is impossible. |
+| **Toggled per environment** | Multi-AZ, deletion protection, Performance Insights and Container Insights: off in dev, **on in `envs/prod`** |
+| **False positive** | Security groups are "unattached" only because they're attached in *another* module |
+
+</details>
+
+<details>
+<summary><b><code>security:gitleaks</code>, secret detection over the full history (≈7 s)</b></summary>
+
+```bash
+gitleaks git . --redact --verbose --report-format sarif --report-path gitleaks.sarif
+```
+
+- 150+ detectors: AWS keys (`AKIA…`), private keys, GitLab/GitHub/Slack tokens, passwords in connection
+  strings, high-entropy strings.
+- **`GIT_DEPTH: 0`** clones the **entire history**. A secret committed and then "deleted" in a later commit is
+  **still leaked**, because it's in history. A scan of only the latest files would miss it.
+- `--redact` masks anything it finds in the job log, so the scan doesn't leak the secret a second time.
+
+</details>
+
+---
+
+### ② `test`: does it work, and is it good code?
+
+| Job | What happens | Output in GitLab |
+|---|---|---|
+| `test:unit` | `pytest` runs **9 tests** against the *real* FastAPI app, with the database swapped for an in-memory repository (the app depends on a `MessageRepository` interface). It covers health, readiness up and down, create and list, ordering, input validation and limit clamping. | **Tests** tab (JUnit), **coverage %** on the MR (79 %), and a line-by-line coverage overlay in the MR diff (Cobertura) |
+| `sonarqube` | Uploads source and coverage to SonarQube and **waits for the quality gate** (`sonar.qualitygate.wait=true`). Bugs, vulnerabilities, security hotspots, code smells, duplication or coverage below the gate **fail the pipeline**. | SonarQube project dashboard |
+
+### ③ `build`: one image per commit
+
+`build:image` runs Docker-in-Docker and:
+1. builds `app/backend` with `--pull`, so the base image is always fresh with the latest OS patches
+2. tags it `guestbook-api:<commit-sha>`, never a mutable tag like `latest`
+3. labels it with `org.opencontainers.image.revision` (the full SHA) and `.source` (the repo URL), so any running
+   container can be traced back to the exact commit
+4. saves it as `image.tar.gz`, a **pipeline artefact, not pushed anywhere yet**
+
+**Build once, deploy many:** this exact tarball is what gets scanned, pushed, deployed to dev and later promoted
+to prod. It's never rebuilt, because a rebuild could pick up different dependencies.
+
+### ④ `scan`: is it safe to publish?
+
+`scan:trivy` scans the **tarball**, *before* it reaches any registry:
+
+```bash
+trivy image --input image.tar.gz --format json --output trivy.json          # full report (artefact)
+trivy convert --format template --template @/contrib/gitlab.tpl ...         # GitLab security widget
+trivy image --input image.tar.gz --exit-code 1 --severity HIGH,CRITICAL --ignore-unfixed   # the GATE
+```
+
+The gate fails the pipeline on any **HIGH or CRITICAL vulnerability that has a fix available**.
+`--ignore-unfixed` keeps the gate actionable: it only blocks on things you can actually fix by upgrading.
+
+> [!IMPORTANT]
+> **This gate caught real vulnerabilities during development.** The first image had **3 HIGH CVEs in Starlette**
+> (CVE-2025-62727 Range-header DoS, CVE-2026-48818 SSRF via UNC paths, CVE-2026-54283 form-limit DoS), pulled in
+> by an older FastAPI. Bumping FastAPI 0.118 → 0.142 and Starlette → 1.7.0 fixed all three. Without the gate,
+> they would have shipped.
+
+### ⑤ `publish`: push the approved image *(main only)*
+
+`publish:image` assumes the deploy role and pushes to **two registries**:
+
+| Registry | Tags | Purpose |
+|---|---|---|
+| **Amazon ECR** `guestbook-api` | `<sha>` (immutable) | **What AWS deploys from.** Private, IAM-controlled, close to Fargate, scanned again on push. If the tag already exists (a pipeline re-run), the push is skipped, because overwriting is impossible by design. |
+| **Docker Hub** [`moes98/test2026`](https://hub.docker.com/r/moes98/test2026) | `<sha>` + `latest` | Public showcase: anyone can `docker run moes98/test2026:latest`. Skipped automatically if `DOCKERHUB_TOKEN` isn't set. |
+
+### ⑥ `plan`: what exactly will change?
+
+`plan:dev` uses the **read-only** role:
+
+1. `terraform init` against the dev state (`s3://guestbook-tfstate-<account>/envs/dev/terraform.tfstate`)
+2. `terraform plan -var-file=../envs/dev/terraform.tfvars -out=tfplan`, with `image_tag` set to this commit
+3. a JSON summary (`create` / `update` / `delete` counts), shown as the **Terraform widget on the merge request**
+
+The saved `tfplan` file is passed to the deploy job, so **what was reviewed is exactly what gets applied**. A fresh
+plan at apply time could differ if something changed in between.
+
+### ⑦ `deploy`: roll out to dev *(main only)*
+
+`deploy:dev` assumes the **deploy** role, then:
+
+| Step | Command | Why |
+|---|---|---|
+| 1 | record the ECS task definition **currently running** | the rollback job needs to know where to return to |
+| 2 | `terraform apply tfplan` | infrastructure changes + a new task definition pointing at `<sha>` |
+| 3 | `aws ecs wait services-stable` | waits for the **rolling deployment**: new tasks start, pass ALB health checks, and only then are old tasks drained and stopped. **Zero downtime** (`minimum_healthy_percent = 100`). |
+| 4 | `aws s3 sync app/frontend s3://… --delete` | upload the static frontend, removing deleted files |
+| 5 | `aws cloudfront create-invalidation --paths "/*"` | clear the CDN cache so users get the new files right away |
+| 6 | write `APP_URL` + `PREV_TASK_DEF` to a dotenv artefact | later jobs read them. `APP_URL` also becomes the clickable link in **GitLab → Environments → dev**. |
+
+If the new tasks keep failing their health checks during step 3, the **ECS deployment circuit breaker** stops the
+rollout and **reverts to the last working version by itself**, and the job fails.
+
+### ⑧ `verify`: is it actually working?
+
+`smoke:dev` runs [`scripts/smoke-test.sh`](scripts/smoke-test.sh) against the **public CloudFront URL**, the same
+path a real user takes:
+
+| # | Check | Proves |
+|:-:|---|---|
+| 1 | `GET /` returns the page `<title>` | CloudFront → S3 (OAC) works, HTTPS works |
+| 2 | `GET http://…` returns **301** | HTTP is redirected to HTTPS |
+| 3 | `GET /api/health` → `version == <this commit>` | **the new code is really live**, not the old version still answering |
+| 4 | `GET /api/ready` → `database: up` | the API can reach RDS (security groups, TLS, secret injection all working) |
+| 5 | `POST` a unique marker, then `GET` it back | full **write + read round trip** through CloudFront → VPC origin → ALB → Fargate → RDS |
+
+Each request is retried for up to about 60 s, because CloudFront and the ALB can take a moment to settle after a deploy.
+
+<a id="rollback"></a>
+
+### ⑨ `rollback`: undo automatically *(main only, **only on failure**)*
+
+```yaml
+rollback:dev:
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      when: on_failure        # ← runs ONLY if an earlier job failed
+```
+
+On a healthy pipeline this job shows as **skipped**, which is the expected result. When something fails, it
+restores the task definition recorded in step ⑦ and waits until the service is stable again.
+
+**Two independent rollback layers**, because failures come in two kinds:
+
+| What went wrong | Example | Who rolls back | How |
 |---|---|---|---|
-| **lint** | `lint:python` · `lint:dockerfile` · `lint:terraform` · `lint:tflint` · `security:checkov` · `security:gitleaks` | MR + main | any failure stops the pipeline |
-| **test** | `test:unit` (JUnit + Cobertura shown in GitLab) · `sonarqube` (waits for the quality gate) | MR + main | failed test / gate |
-| **build** | `build:image`: labelled with the commit SHA, saved as an artefact | MR + main | |
-| **scan** | `scan:trivy`: GitLab container-scanning report + hard gate | MR + main | fixable HIGH/CRITICAL |
-| **publish** | `publish:image`: ECR (immutable) + Docker Hub `:sha` and `:latest` | main | |
-| **plan** | `plan:dev`: read-only role, plan summary widget in the MR | MR + main | |
-| **deploy** | `deploy:dev`: apply the saved plan, wait for ECS steady state, sync the frontend, invalidate CloudFront | main | ECS circuit breaker |
-| **verify** | `smoke:dev`: HTTPS, HTTP→HTTPS redirect, **deployed version = commit**, DB readiness, write/read round trip | main | |
-| **rollback** | `rollback:dev`: reverts ECS to the task definition recorded *before* deploy | main, **on failure** | |
-| **promote** | `deploy:prod`: same image, prod `tfvars`, **manual** | main | human approval |
+| New version **crashes** | bad import, wrong port, can't start | **ECS circuit breaker** | inside the deploy, automatically, without the pipeline |
+| New version **runs but behaves wrong** | returns wrong data, can't write to the DB | **`rollback:dev` job** | after the smoke test fails |
+| Pipeline fails *before* deploying | lint, test or Trivy failure | nothing to roll back | the job exits cleanly: *"No previous task definition recorded"* |
 
-**Two layers of rollback:**
-1. **ECS deployment circuit breaker:** if new tasks fail their health checks, ECS reverts to the last steady
-   state by itself, without the pipeline.
-2. **Pipeline rollback job:** if tasks are healthy but the *smoke test* fails (wrong behaviour, not a crash),
-   the job restores the previous task definition.
+<details>
+<summary><b>Example: what a failed deploy looks like</b></summary>
 
-`resource_group`s serialize deploys per environment, so two pipelines can never apply at the same time.
+```text
+deploy:dev    ✅  records PREV_TASK_DEF = guestbook-dev-api:7, deploys :8
+smoke:dev     ❌  "SMOKE FAIL: written message not returned"
+rollback:dev  ✅  "Rolling ECS back to guestbook-dev-api:7" → services-stable
+                  "Rolled back. The next successful pipeline on main re-converges Terraform state."
+```
+
+Terraform state still says `:8` after a rollback. The next green pipeline re-applies and converges, which is a
+known and accepted property of out-of-band rollbacks.
+
+</details>
+
+<a id="prod"></a>
+
+### ⑩ `promote`: production *(main only, **manual**)*
+
+`deploy:prod` is a **▶ manual job**: production requires a **human approval** after dev has been verified. It:
+
+1. uses the **same image tag** that just passed every gate in dev (no rebuild)
+2. runs `terraform plan` + `apply` with [`envs/prod/terraform.tfvars`](infra/envs/prod/terraform.tfvars) against
+   its **own state file** (`envs/prod/terraform.tfstate`) and its own `resource_group`
+3. is marked `allow_failure: true`, so the dev pipeline is green whether or not someone promotes
+
+**What changes in prod is configuration, never code:**
+
+| Setting | dev | prod |
+|---|---|---|
+| Availability zones | 2 | **3** |
+| API tasks (autoscaling) | 1 → 3 | **2 → 10** |
+| Task network | public subnets, no NAT | **private subnets + NAT per AZ** |
+| Task size | 0.25 vCPU / 0.5 GB | **0.5 vCPU / 1 GB** |
+| Database | `db.t4g.micro`, single-AZ | **`db.t4g.medium`, Multi-AZ**, storage autoscaling to 100 GB, Performance Insights |
+| Deletion protection / final snapshot | off | **on** |
+| WAF | off | **on** (common rules + known bad inputs/Log4j + rate limit) |
+| RDS PITR window | 1 day | **14 days** |
+| AWS Backup | daily, 7 days | daily 14 days + **weekly 90 days** + **cross-region copy** + **vault lock** |
+| Log retention | 14 days | **90 days** |
+| Container Insights | off | **on** |
+
+> [!WARNING]
+> **prod was deliberately *not* deployed.** It's fully defined and validated, but:
+> 1. **Cost:** roughly **$8–10/day** (3 NAT gateways ≈ $3.30, Multi-AZ `db.t4g.medium` ≈ $3.20, ALB + 2–3 tasks ≈ $1.50,
+>    WAF ≈ $0.30) against dev's ~$1.70.
+> 2. **Free plan limits:** this account's AWS Free plan rejects RDS backup retention above 1 day
+>    (`FreeTierRestrictionError`), and its organization SCP blocks the CI role in `eu-central-1` (the DR copy region).
+>    Prod as designed needs a **paid account**, which is exactly where it belongs.
+>
+> The brief explicitly allows describing production instead of running it. Here it's not just described but
+> **written as code**: switching it on is the ▶ button.
+
+---
+
+### 🔑 CI/CD variables reference
+
+Set in **Settings → CI/CD → Variables**. **Nothing secret is in the repository.**
+
+| Variable | Masked | Protected | Purpose |
+|---|:---:|:---:|---|
+| `AWS_ACCOUNT_ID` | | | builds role ARNs, ECR and state-bucket names (not a secret) |
+| `AWS_PLAN_ACCESS_KEY_ID` / `_SECRET_ACCESS_KEY` | ✅ | | can **only** assume `guestbook-ci-plan` (read-only). Available to MRs. |
+| `AWS_DEPLOY_ACCESS_KEY_ID` / `_SECRET_ACCESS_KEY` | ✅ | ✅ | can **only** assume `guestbook-ci-deploy`. **Only on `main`.** |
+| `ALERT_EMAIL` | | | subscribed to the SNS alert topic |
+| `DOCKERHUB_TOKEN` | ✅ | ✅ | Docker Hub access token (Read & Write). Optional. |
+| `SONAR_HOST_URL` / `SONAR_TOKEN` | ✅ | | instance-level on this GitLab |
+
+How a job gets AWS access ([`ci/aws-auth.sh`](ci/aws-auth.sh)):
+
+```text
+masked key ──▶ ~/.aws/credentials [ci-base]    (file mode 600, never exported as env vars)
+                     │
+                     ▼  sts:AssumeRole  (the ONLY permission the key has)
+               ~/.aws/config [profile ci] → role guestbook-ci-<plan|deploy>, 1-hour session
+                     │
+                     ▼
+               AWS_PROFILE=ci → used by both the AWS CLI and Terraform
+```
 
 ---
 
@@ -474,6 +810,9 @@ dev in `eu-north-1`, running 24/7. *Estimates.* The demo ran for a few hours.
 | CloudFront · S3 · CloudWatch · SNS · Secrets Manager · Backup | ~2.0 |
 | **Total** | **≈ 50 → ≈ $1.70 / day**, covered by Free plan credits |
 
+**prod, if promoted:** roughly **$8–10/day**: 3 NAT gateways (~$3.30), Multi-AZ `db.t4g.medium` (~$3.20),
+ALB + 2–3 larger tasks (~$1.50), WAF (~$0.30). That's why it's defined as code and not left running.
+
 **Biggest saving:** no NAT gateway in dev (−$35/month). **Biggest prod cost drivers:** NAT per AZ, Multi-AZ RDS,
 WAF. All three are behind toggles.
 
@@ -548,6 +887,60 @@ cd ../bootstrap && terraform destroy
 | Access logs and WAF logs off | Avoids a log bucket and its cost | Central log-archive account |
 | dev PITR window is 1 day | The AWS Free plan rejects longer RDS backup retention (`FreeTierRestrictionError`) | 14 days in prod, plus AWS Backup daily and weekly copies |
 | prod defined but not left running | Cost | Same code, `envs/prod/terraform.tfvars` |
+
+---
+
+<a id="problems"></a>
+
+## 🐞 Real problems hit during the build, and how they were solved
+
+The first deploy didn't go green straight away. These are the actual issues, in order, with the diagnosis and
+the fix. Each one is in the git history.
+
+| # | Symptom | Root cause | Fix |
+|:-:|---|---|---|
+| 1 | Trivy gate failed: **3 HIGH CVEs** | FastAPI 0.118 pulled in a vulnerable Starlette 0.48 | Bumped FastAPI → 0.142 and pinned Starlette 1.7.0. The gate passes with 0 HIGH/CRITICAL. **The gate worked as intended.** |
+| 2 | Checkov: **43 failed checks** | First draft lacked ALB deletion protection, backup-key policies, S3 multipart cleanup, RDS IAM auth and explicit WAF rules | Fixed the real gaps and documented the intentional exceptions, ending at **279 passed / 0 failed** |
+| 3 | `build:image` **hung forever** at `until docker info` | Docker-in-Docker was configured for TLS (`DOCKER_TLS_CERTDIR=/certs`), but the runner has no shared `/certs/client` volume, so the client could never connect | dind over plain TCP (`DOCKER_HOST=tcp://docker:2375`, reachable only inside the job's service network), plus a **60-second bounded wait** that fails with a clear message instead of hanging |
+| 4 | `plan:dev`: `AccessDenied … explicit deny in a service control policy` | The AWS Free plan account sits in an AWS-managed organization whose **SCP denies the CI role in `eu-central-1`**. The DR-copy provider was configured for that region even though DR copies are off in dev. | The copy-region provider now points at the primary region **unless** `enable_cross_region_backup = true`. A stack shouldn't touch a region it doesn't use. |
+| 5 | `deploy:dev`: `FreeTierRestrictionError` creating RDS | The Free plan rejects RDS backup retention > 1 day | dev retention set to **1 day** (point-in-time recovery still works); prod stays at 14 |
+
+**What this shows about the design:** every failure was **caught by the pipeline, contained, and fixed forward**:
+- Lint and scan failures stopped the pipeline before anything was deployed.
+- Failed applies left **consistent, resumable state**: on the next run, Terraform created only the remaining
+  resources (the database and its dependents) on top of the 76 already there.
+- No manual console changes were needed at any point.
+
+---
+
+<a id="verified"></a>
+
+## 🔬 Verified results (live dev deployment)
+
+Pipeline **#22772** on commit `9681c7f`: **all 14 automatic jobs green**, `rollback:dev` skipped (nothing
+failed), `deploy:prod` waiting for manual approval.
+
+| Job | Duration |
+|---|---:|
+| lint (6 jobs, in parallel) | 6–67 s |
+| test:unit · sonarqube | 29 s · 23 s |
+| build:image · scan:trivy · publish:image | 57 s · 30 s · 50 s |
+| plan:dev | 50 s |
+| deploy:dev *(first creation of RDS + ECS)* | 631 s |
+| smoke:dev | 10 s |
+
+Checked directly against AWS after the deploy:
+
+| Check | Result |
+|---|---|
+| App URL (CloudFront) | `https://d1w7nsnn0e57ya.cloudfront.net`: frontend **200**, HTTP → **301** |
+| `/api/health` | `{"status":"ok","version":"9681c7f0","env":"dev"}`, **the deployed version is the commit** |
+| `/api/ready` | `{"status":"ready","database":"up"}` |
+| ALB scheme | **`internal`**. Even **public DNS** resolves it only to private `10.20.x.x` addresses, so there's nothing on the internet to attack. |
+| ECS service | 1/1 tasks running, target **healthy** |
+| RDS | `db.t4g.micro` · **StorageEncrypted: true** · **PubliclyAccessible: false** · retention 1 day |
+| CloudWatch alarms | all 8 created. `api-no-healthy-targets` correctly fired **before** the first task registered (missing data is treated as *down*), then cleared. |
+| SNS | email subscription created (requires the recipient to confirm) |
 
 ---
 
