@@ -1,0 +1,37 @@
+# Terraform
+**/.terraform/*
+*.tfstate
+*.tfstate.*
+*.tfplan
+tfplan
+tfplan.json
+crash.log
+override.tf
+override.tf.json
+*_override.tf
+*.auto.tfvars
+.terraform.tfstate.lock.info
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+report.xml
+.venv/
+
+# CI artefacts
+image.tar.gz
+trivy.json
+gl-container-scanning-report.json
+checkov.xml
+gitleaks.sarif
+.trivycache/
+.sonar/
+
+# Local secrets
+.env
+.env.*
+*.pem

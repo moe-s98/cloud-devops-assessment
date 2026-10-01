@@ -1,0 +1,45 @@
+# Checkov exceptions. Every skip is a conscious decision, not a silenced alarm.
+framework:
+  - terraform
+compact: true
+quiet: true
+skip-check:
+  # --- Internal ALB behind a CloudFront VPC origin -------------------------
+  # The ALB has no public IP; CloudFront connects to it privately on HTTP:80.
+  # Viewer traffic is HTTPS-only at CloudFront. HTTPS to the origin needs a
+  # custom domain + ACM cert (README: production changes).
+  - CKV_AWS_2      # ALB listener protocol HTTPS
+  - CKV_AWS_103    # ALB listener TLS 1.2
+  - CKV_AWS_378    # target group HTTP
+  - CKV2_AWS_20    # ALB HTTP->HTTPS redirect
+  - CKV_AWS_91     # ALB access logs (needs log bucket; prod item)
+  - CKV_AWS_260    # false positive: port 80 ingress is the CloudFront prefix list, not 0.0.0.0/0
+  - CKV2_AWS_5     # false positive: SGs are attached in other modules
+  # --- CloudFront without a custom domain --------------------------------
+  - CKV2_AWS_42    # custom SSL cert (no domain owned for the assessment)
+  - CKV_AWS_174    # min TLS version cannot be set with the default *.cloudfront.net cert
+  - CKV_AWS_310    # origin failover group (single-region by design, see README)
+  - CKV_AWS_374    # geo restriction (public app)
+  - CKV_AWS_86     # CloudFront access logs (cost; prod item)
+  - CKV2_AWS_31    # WAF logging (cost; prod item)
+  - CKV2_AWS_47    # false positive: WAF (count-conditional) includes AWSManagedRulesKnownBadInputsRuleSet (Log4JRCE)
+  # --- S3 -------------------------------------------------------------------
+  - CKV_AWS_18     # S3 access logging (CloudTrail data events cover state bucket in prod)
+  - CKV_AWS_144    # cross-region replication (frontend is a rebuildable artefact)
+  - CKV2_AWS_62    # S3 event notifications (no consumer)
+  - CKV_AWS_145    # frontend bucket uses SSE-S3: public static files, and OAC + SSE-KMS needs extra key policy for no gain
+  # --- Toggled per environment (enabled in envs/prod) -----------------------
+  - CKV_AWS_157    # RDS Multi-AZ           -> db_multi_az
+  - CKV_AWS_293    # RDS deletion protection -> db_deletion_protection
+  - CKV_AWS_150    # ALB deletion protection -> db_deletion_protection
+  - CKV_AWS_353    # Performance Insights    -> db_performance_insights
+  - CKV_AWS_65     # Container Insights      -> container_insights
+  - CKV_AWS_338    # 1-year log retention    -> log/flow retention variables
+  - CKV_AWS_118    # RDS enhanced monitoring (CloudWatch RDS metrics + PI used instead)
+  # --- Design decisions documented in README ---------------------------------
+  - CKV_AWS_273    # IAM users for CI: GitLab is private, so OIDC federation is impossible
+  - CKV_AWS_40     # inline user policy: the only permission is sts:AssumeRole on one role
+  - CKV_AWS_109    # KMS key policy "kms:*" to account root = standard IAM delegation
+  - CKV_AWS_111
+  - CKV_AWS_356
+  - CKV_AWS_394    # AZ list is filtered to "available"; count is controlled by az_count

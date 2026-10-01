@@ -1,0 +1,44 @@
+# Full stack locally: `docker compose up --build` then open http://localhost:8080
+name: guestbook
+
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: guestbook
+      POSTGRES_USER: guestbook
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-local-dev-only}
+    volumes:
+      - db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U guestbook -d guestbook"]
+      interval: 5s
+      retries: 10
+
+  api:
+    build:
+      context: app/backend
+      args:
+        APP_VERSION: local
+    environment:
+      DB_HOST: db
+      DB_NAME: guestbook
+      DB_USER: guestbook
+      DB_PASSWORD: ${DB_PASSWORD:-local-dev-only}
+      DB_SSLMODE: disable
+      APP_ENV: local
+    read_only: true
+    security_opt: ["no-new-privileges:true"]
+    depends_on:
+      db:
+        condition: service_healthy
+
+  frontend:
+    build: app/frontend
+    ports:
+      - "8080:8080"
+    depends_on:
+      - api
+
+volumes:
+  db-data:
