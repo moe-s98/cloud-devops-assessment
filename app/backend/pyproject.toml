@@ -3,7 +3,10 @@ testpaths = ["tests"]
 addopts = "-q"
 
 [tool.coverage.run]
-source = ["app"]
+# Measure from the project root so report paths read "app/main.py",
+# which SonarQube resolves against sonar.projectBaseDir=app/backend.
+source = ["."]
+omit = ["tests/*"]
 relative_files = true
 
 [tool.ruff]

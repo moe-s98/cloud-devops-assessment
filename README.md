@@ -1118,19 +1118,92 @@ for CI, GuardDuty, Security Hub, an organization CloudTrail trail and AWS Config
 
 ---
 
+<a id="evidence"></a>
+
 ## 📸 Evidence
 
-Screenshots are in [`docs/evidence/`](docs/evidence/). The deployment was destroyed afterwards, as permitted.
+Screenshots from the live dev deployment. **Click any image to open it full size.** All files are in
+[`docs/evidence/`](docs/evidence/). The environment was destroyed afterwards, as the brief allows.
 
-| # | Shows | # | Shows |
-|:-:|---|:-:|---|
-| 01 | Full pipeline green on `main` | 08 | CloudWatch dashboard |
-| 02 | Unit tests and coverage in GitLab | 09 | Alarm firing + email received |
-| 03 | SonarQube quality gate | 10 | Autoscaling under k6 load |
-| 04 | Trivy: no fixable HIGH/CRITICAL | 11 | *(restore drill not run, script provided)* |
-| 05 | `terraform apply` | 12 | Image on Docker Hub |
-| 06 | App working through CloudFront | 13 | `terraform destroy` |
-| 07 | ECS · internal ALB · private RDS · secret | | |
+### CI/CD
+
+**01 · pipeline**: Pipeline #22773 on `main`: all 16 jobs across 10 stages. Everything green, `rollback:dev` skipped (nothing failed), `deploy:prod` waiting for manual approval.
+
+[![01-pipeline](docs/evidence/01-pipeline.png)](docs/evidence/01-pipeline.png)
+
+**02 · tests**: `test` stage: unit tests and the SonarQube job passed.
+
+[![02-tests](docs/evidence/02-tests.png)](docs/evidence/02-tests.png)
+
+**03 · sonarqube**: SonarQube **quality gate: Passed**. 0 new issues, 0 security hotspots (rating A).
+
+[![03-sonarqube](docs/evidence/03-sonarqube.png)](docs/evidence/03-sonarqube.png)
+
+**04 · trivy**: `scan:trivy`: clean, no fixable HIGH/CRITICAL vulnerabilities. Report uploaded to GitLab container scanning.
+
+[![04-trivy](docs/evidence/04-trivy.png)](docs/evidence/04-trivy.png)
+
+**05 · terraform apply**: `deploy:dev`: `terraform apply tfplan` → rolling ECS update → wait for steady state → S3 sync → CloudFront invalidation. Outputs include the app URL.
+
+[![05-terraform-apply](docs/evidence/05-terraform-apply.png)](docs/evidence/05-terraform-apply.png)
+
+### Application
+
+**06 · app**: The live app through CloudFront. The status line shows the **deployed commit (`d0c29b69`)** and **database up**. Messages include ones written by the pipeline's smoke tests.
+
+[![06-app](docs/evidence/06-app.png)](docs/evidence/06-app.png)
+
+### AWS resources
+
+**07a · ecs**: ECS service `guestbook-dev-api`: Active, deployment **Success**, ALB target **Healthy**, health-check grace period 30 s.
+
+[![07a-ecs](docs/evidence/07a-ecs.png)](docs/evidence/07a-ecs.png)
+
+**07b · alb**: ALB **Scheme: Internal**, spread over 2 AZs. Listener default action **403 Forbidden**, with forwarding only by the `X-Origin-Verify` rule.
+
+[![07b-alb](docs/evidence/07b-alb.png)](docs/evidence/07b-alb.png)
+
+**07c · rds**: RDS `db.t4g.micro` PostgreSQL. **Internet access gateway: Disabled**, **IAM authentication: Enabled**, master credentials in **Secrets Manager**.
+
+[![07c-rds](docs/evidence/07c-rds.png)](docs/evidence/07c-rds.png)
+
+**07d · secret**: The DB secret is **created and managed by RDS** and encrypted with the customer-managed key **guestbook-dev-main**.
+
+[![07d-secret](docs/evidence/07d-secret.png)](docs/evidence/07d-secret.png)
+
+**07e · cloudfront**: CloudFront origins: `alb-api` is a **VPC origin** (internal ALB), and `s3-frontend` uses **Origin Access Control**.
+
+[![07e-cloudfront](docs/evidence/07e-cloudfront.png)](docs/evidence/07e-cloudfront.png)
+
+### Monitoring & alerting
+
+**08 · dashboard**: Dashboard `guestbook-dev-overview` (Terraform-defined): requests, 5xx, latency p50/p95, healthy tasks, ECS CPU/memory, app error logs, RDS CPU/connections, and 7 alarms all OK.
+
+[![08-dashboard](docs/evidence/08-dashboard.png)](docs/evidence/08-dashboard.png)
+
+**09 · alarm email**: Alarm notification **delivered by email** via the KMS-encrypted SNS topic: `guestbook-dev-api-5xx` OK → ALARM, with threshold, metric and dimensions.
+
+[![09-alarm-email](docs/evidence/09-alarm-email.png)](docs/evidence/09-alarm-email.png)
+
+### Load test & autoscaling
+
+**10a · dashboard load**: *Healthy tasks* jumps **1 → 3** during the k6 load test.
+
+[![10a-dashboard-load](docs/evidence/10a-dashboard-load.png)](docs/evidence/10a-dashboard-load.png)
+
+**10b · ecs tasks**: Cluster view: **3 tasks running**. Two new tasks started about 41 s earlier, alongside the original.
+
+[![10b-ecs-tasks](docs/evidence/10b-ecs-tasks.png)](docs/evidence/10b-ecs-tasks.png)
+
+**10c · scaling event**: Service events: *"Successfully set desired count to 3 … Cause: monitor alarm TargetTracking-…-AlarmHigh in state ALARM triggered policy guestbook-dev-api-requests"*, then 2 tasks started, 2 targets registered and steady state reached.
+
+[![10c-scaling-event](docs/evidence/10c-scaling-event.png)](docs/evidence/10c-scaling-event.png)
+
+### Not included
+
+| # | Item | Why |
+|:-:|---|---|
+| 11 | Restore drill | Script provided ([`scripts/restore-drill.sh`](scripts/restore-drill.sh)), not run for this submission |
 
 <div align="center">
 <br/>
