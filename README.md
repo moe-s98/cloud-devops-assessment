@@ -69,7 +69,7 @@ leaves the time budget for what the assessment actually measures, **the platform
 #### 📈 Operations
 - CloudWatch **dashboard as code**, **8 alarms**, log-based metric
 - Autoscaling on CPU **and** request rate
-- **Tested** point-in-time restore with measured RTO
+- Point-in-time restore **drill script** with automatic PASS/FAIL and RTO measurement
 - HA, WAF, DR copies and vault lock behind **one-line toggles**
 
 </td>
@@ -932,7 +932,9 @@ Implemented, not just described. **Flip the toggles in [`envs/prod/terraform.tfv
 > 4. **PASS = A present, B absent**: the restore landed on the exact second requested
 > 5. prints the **measured RTO** and deletes the copy
 >
-> Targets: **RPO ≈ 5 min** (transaction-log shipping) · **RTO ≈ 15–20 min** (measured).
+> Targets: **RPO ≈ 5 min** (transaction-log shipping) · **RTO ≈ 15–20 min** (typical for a `db.t4g.micro` PITR restore).
+>
+> *The drill script is included and ready to run. It wasn't executed for this submission, to keep within the time budget.*
 
 ---
 
@@ -1080,7 +1082,17 @@ Checked directly against AWS after the deploy:
 | ECS service | 1/1 tasks running, target **healthy** |
 | RDS | `db.t4g.micro` · **StorageEncrypted: true** · **PubliclyAccessible: false** · retention 1 day |
 | CloudWatch alarms | all 8 created. `api-no-healthy-targets` correctly fired **before** the first task registered (missing data is treated as *down*), then cleared. |
-| SNS | email subscription created (requires the recipient to confirm) |
+| SNS → email | subscription confirmed. A test alarm (`api-5xx` → ALARM) was **delivered by email** through the encrypted topic. |
+
+**Load test & autoscaling** (`k6 run scripts/load-test.js`, ramp to 60 virtual users over 7 min, through CloudFront):
+
+| Metric | Result |
+|---|---|
+| Requests | **25,111** (~60 req/s) · failed **0.00 %** · checks **100 %** |
+| Latency | median 308 ms · p90 618 ms · **p95 773 ms** (threshold < 800 ms ✓) |
+| Load per task | 2,837 → 4,548 requests/min against a target of 500 |
+| Scale-out | target-tracking alarm `RequestCountPerTarget > 500` for 3 × 1 min → ECS *"has started 2 tasks"* → **1 → 3 tasks running in about 45 s** |
+| Reaction time | about 5–6 min from load start: 3 one-minute datapoints are required, and ALB metrics arrive about 2 min late. For spiky traffic in prod: a higher `min_tasks` or step scaling on a shorter period. |
 
 ---
 
@@ -1115,7 +1127,7 @@ Screenshots are in [`docs/evidence/`](docs/evidence/). The deployment was destro
 | 01 | Full pipeline green on `main` | 08 | CloudWatch dashboard |
 | 02 | Unit tests and coverage in GitLab | 09 | Alarm firing + email received |
 | 03 | SonarQube quality gate | 10 | Autoscaling under k6 load |
-| 04 | Trivy: no fixable HIGH/CRITICAL | 11 | Restore drill **PASS** + RTO |
+| 04 | Trivy: no fixable HIGH/CRITICAL | 11 | *(restore drill not run, script provided)* |
 | 05 | `terraform apply` | 12 | Image on Docker Hub |
 | 06 | App working through CloudFront | 13 | `terraform destroy` |
 | 07 | ECS · internal ALB · private RDS · secret | | |
