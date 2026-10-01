@@ -77,6 +77,10 @@ leaves the time budget for what the assessment actually measures, **the platform
 </table>
 
 > [!NOTE]
+> **Status: dev was deployed, verified and then destroyed** (`terraform destroy`: 88 resources, 2026-10-01).
+> The URLs below are no longer live. The [evidence screenshots](#evidence) show it running.
+> The tiny bootstrap layer (state bucket, ECR, CI identities) was kept so the pipeline can be re-run on request.
+>
 > Built and demonstrated on an **AWS Free plan account**. Everything fits inside the free credits (~$1.70/day while
 > running). The environment was **destroyed after recording the evidence**, as the brief allows. See
 > [Evidence](#-evidence).
@@ -1059,6 +1063,8 @@ the fix. Each one is in the git history.
 
 ## 🔬 Verified results (live dev deployment)
 
+*(Environment since destroyed; see [Teardown](#teardown).)*
+
 Pipeline **#22772** on commit `9681c7f`: **all 14 automatic jobs green**, `rollback:dev` skipped (nothing
 failed), `deploy:prod` waiting for manual approval.
 
@@ -1208,6 +1214,22 @@ Screenshots from the live dev deployment. **Click any image to open it full size
 ```bash
 docker pull moes98/test2026:latest
 ```
+
+<a id="teardown"></a>
+
+### Teardown
+
+**13 · destroy**: `terraform destroy` on the dev stack: **`Destroy complete! Resources: 88 destroyed.`** Then checked
+directly in AWS: no RDS instances, ECS services, load balancers, NAT gateways, Elastic IPs, CloudFront distributions or VPCs
+remain. The two KMS keys are in AWS's mandatory 7-day *PendingDeletion* window, which isn't billed.
+
+[![13-destroy](docs/evidence/13-destroy.png)](docs/evidence/13-destroy.png)
+
+| Kept on purpose (≈ $0/month) | Why | Remove with |
+|---|---|---|
+| S3 `guestbook-tfstate-*` | Terraform state history | `infra/bootstrap` → `terraform destroy` (empty the bucket first) |
+| ECR `guestbook-api` (~33 MB) | lets the pipeline redeploy without rebuilding | same |
+| IAM users/roles `guestbook-ci-*` | CI access if a re-run is requested | same, after deleting their access keys |
 
 ### Not included
 
