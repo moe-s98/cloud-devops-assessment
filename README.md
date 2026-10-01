@@ -440,7 +440,7 @@ Implemented, not just described. **Flip the toggles in [`envs/prod/terraform.tfv
 
 | Layer | Mechanism |
 |---|---|
-| **RDS** | Automated backups with **point-in-time recovery** (dev 7 days · prod 14 days) |
+| **RDS** | Automated backups with **point-in-time recovery** (prod 14 days · dev 1 day, the maximum the AWS Free plan allows) |
 | **AWS Backup** | Dedicated vault with its **own KMS key**. Daily (7 / 14 days) and weekly (prod: 90 days) rules. Selection by `backup=true` + matching `Environment`. |
 | **DR** *(prod)* | Every recovery point **copied to `eu-central-1`** |
 | **Ransomware** *(prod)* | **Vault lock (compliance mode)**: no early deletion, *not even by an admin* |
@@ -546,6 +546,7 @@ cd ../bootstrap && terraform destroy
 | Migrations at app start-up | Idempotent + advisory lock is safe at this scale | Alembic as a separate pre-deploy ECS task |
 | Deploy role is *scoped*, not *minimal* | Exact action lists take iterations | IAM Access Analyzer policy generation from CloudTrail |
 | Access logs and WAF logs off | Avoids a log bucket and its cost | Central log-archive account |
+| dev PITR window is 1 day | The AWS Free plan rejects longer RDS backup retention (`FreeTierRestrictionError`) | 14 days in prod, plus AWS Backup daily and weekly copies |
 | prod defined but not left running | Cost | Same code, `envs/prod/terraform.tfvars` |
 
 ---
