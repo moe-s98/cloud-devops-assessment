@@ -1,0 +1,47 @@
+flowchart LR
+    classDef src fill:#FFF7ED,stroke:#EA580C,color:#431407
+    classDef cw fill:#FCE7F3,stroke:#DB2777,color:#500724
+    classDef al fill:#FEE2E2,stroke:#DC2626,color:#450A0A
+    classDef out fill:#F3F4F6,stroke:#6B7280,color:#111
+
+    APP["API container<br/>JSON logs: ts, level, method,<br/>path, status, duration_ms"]:::src
+    ALBM["ALB metrics<br/>RequestCount · 5XX · TargetResponseTime<br/>HealthyHostCount"]:::src
+    ECSM["ECS metrics<br/>CPUUtilization · MemoryUtilization"]:::src
+    RDSM["RDS metrics + postgresql log export<br/>CPU · FreeStorageSpace · connections"]:::src
+    BKE["AWS Backup events<br/>job state changes"]:::src
+    VFL["VPC flow logs (REJECT)"]:::src
+
+    subgraph CW["Amazon CloudWatch"]
+        LG1["/guestbook-dev/ecs/api<br/>KMS · 14 days"]:::cw
+        LG2["/guestbook-dev/vpc-flow-logs<br/>KMS · 7 days"]:::cw
+        LG3["/aws/rds/instance/…/postgresql"]:::cw
+        MF["Metric filter { $.level = ERROR }<br/>→ Guestbook/guestbook-dev AppErrorCount"]:::cw
+        DASH["Dashboard guestbook-dev-overview<br/>requests · 5xx · p50/p95 · healthy tasks<br/>ECS CPU/mem · app errors · RDS CPU/conns<br/>alarm status · Logs Insights: recent errors"]:::cw
+
+        subgraph ALARMS["8 alarms (alarm + OK actions)"]
+            A1["api-no-healthy-targets &lt; 1 · 2 min<br/>missing data = breaching"]:::al
+            A2["api-5xx ≥ 5 / 5 min"]:::al
+            A3["api-latency-p95 &gt; 1 s · 3 of 5 min"]:::al
+            A4["api-error-logs ≥ 5 / 5 min"]:::al
+            A5["ecs-cpu-high / ecs-memory-high &gt; 80 % · 10 min"]:::al
+            A6["rds-cpu-high &gt; 80 % · 15 min"]:::al
+            A7["rds-free-storage-low &lt; 2 GB"]:::al
+        end
+    end
+
+    EB["EventBridge rule<br/>backup FAILED / ABORTED / EXPIRED"]:::al
+    SNS["SNS guestbook-dev-alerts<br/>KMS-encrypted topic"]:::out
+    MAIL(["m.samir.ibrahim98@…"]):::out
+    ASG["Application Auto Scaling<br/>target tracking: CPU 60 % · 500 req/task"]:::out
+
+    APP --> LG1 --> MF --> A4
+    ALBM --> A1 & A2 & A3
+    ECSM --> A5
+    RDSM --> A6 & A7
+    RDSM --> LG3
+    VFL --> LG2
+    ALBM & ECSM --> ASG
+    BKE --> EB
+    A1 & A2 & A3 & A4 & A5 & A6 & A7 --> SNS
+    EB --> SNS --> MAIL
+    LG1 & ALBM & ECSM & RDSM -.-> DASH

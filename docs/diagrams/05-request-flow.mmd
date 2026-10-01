@@ -1,0 +1,37 @@
+sequenceDiagram
+    autonumber
+    actor U as User browser
+    participant CF as CloudFront (edge)
+    participant S3 as S3 frontend (private)
+    participant VO as VPC origin
+    participant ALB as Internal ALB
+    participant API as Fargate task (FastAPI)
+    participant DB as RDS PostgreSQL
+
+    U->>CF: GET http://d1w7…cloudfront.net/
+    CF-->>U: 301 → https://
+    U->>CF: GET https://…/ (TLS)
+    alt cache hit
+        CF-->>U: index.html from edge cache
+    else cache miss
+        CF->>S3: GET /index.html (SigV4 signed by OAC)
+        Note over S3: bucket policy allows only<br/>cloudfront.amazonaws.com with<br/>SourceArn = this distribution
+        S3-->>CF: 200 index.html, app.js, styles.css
+        CF-->>U: 200 + HSTS, X-Frame-Options, nosniff
+    end
+
+    U->>CF: POST /api/messages {"author","body"}
+    Note over CF: /api/* behaviour: caching disabled,<br/>all viewer headers except Host forwarded,<br/>adds X-Origin-Verify (shared secret)
+    CF->>VO: forward over the AWS private network
+    VO->>ALB: HTTP :80 (SG allows CloudFront prefix list only)
+    alt header missing or wrong
+        ALB-->>CF: 403 Forbidden (default action)
+    else header matches
+        ALB->>API: forward to a healthy target on :8000
+        API->>API: pydantic validation (1-64 / 1-500 chars), else 422
+        API->>DB: INSERT … VALUES (%s, %s) over TLS (sslmode=require)
+        DB-->>API: RETURNING id, author, body, created_at
+        API-->>ALB: 201 Created (JSON) + JSON access log line → CloudWatch
+        ALB-->>CF: 201
+        CF-->>U: 201
+    end

@@ -1,0 +1,36 @@
+sequenceDiagram
+    autonumber
+    participant GL as deploy:dev job
+    participant TF as Terraform
+    participant ECS as ECS service
+    participant OLD as Task v1 (running)
+    participant NEW as Task v2 (new image)
+    participant ALB as ALB target group
+    participant SM as smoke:dev / rollback:dev
+
+    GL->>ECS: describe-services, record PREV_TASK_DEF = v1
+    GL->>TF: terraform apply tfplan (image_tag = sha)
+    TF->>ECS: register task definition v2 + update service
+    Note over ECS: rolling update · minimumHealthyPercent 100 ·<br/>maximumPercent 200 · circuit breaker (rollback = true)
+    ECS->>NEW: start task (pull ECR :sha, inject DB secret)
+    NEW->>NEW: container healthcheck /api/health
+    ECS->>ALB: register v2 target
+    alt v2 healthy (2 × 15 s checks)
+        ALB-->>ECS: healthy
+        ECS->>OLD: deregister (15 s drain) → stop
+        GL->>GL: wait services-stable OK · s3 sync · invalidate
+        GL->>SM: APP_URL, PREV_TASK_DEF (dotenv)
+        SM->>SM: smoke test 5 checks
+        alt smoke passes
+            Note over SM: pipeline green · rollback skipped · prod available
+        else smoke fails (runs but behaves wrong)
+            SM->>ECS: rollback:dev → update-service --task-definition v1
+            ECS->>OLD: start v1 again, then drain v2
+            Note over SM: rolled back · next green pipeline re-converges state
+        end
+    else v2 keeps failing health checks (crash, bad config)
+        ALB-->>ECS: unhealthy
+        ECS->>ECS: circuit breaker trips → roll back to v1 automatically
+        Note over OLD: v1 never stopped, so zero downtime
+        GL-->>GL: wait services-stable fails → job FAIL
+    end

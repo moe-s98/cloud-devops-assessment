@@ -22,7 +22,7 @@
 
 <br/>
 
-**[Architecture](#-architecture)** · **[Why these choices](#-why-i-chose-what-i-chose)** · **[Pipeline](#-cicd-pipeline)** · **[Rollback](#rollback)** · **[Prod](#prod)** · **[Security](#-security)** · **[Monitoring](#-monitoring--alerting)** · **[Backups](#-backups--disaster-recovery)** · **[Cost](#-cost)** · **[Problems solved](#problems)** · **[Verified](#verified)** · **[Production](#-how-this-changes-for-real-production)**
+**[Architecture](#-architecture)** · **[Diagrams](#diagrams)** · **[Why these choices](#-why-i-chose-what-i-chose)** · **[Pipeline](#-cicd-pipeline)** · **[Rollback](#rollback)** · **[Prod](#prod)** · **[Security](#-security)** · **[Monitoring](#-monitoring--alerting)** · **[Backups](#-backups--disaster-recovery)** · **[Cost](#-cost)** · **[Problems solved](#problems)** · **[Verified](#verified)** · **[Production](#-how-this-changes-for-real-production)**
 
 </div>
 
@@ -96,7 +96,7 @@ How each requirement in the brief maps to this repository:
 | D | Monitoring + logging + **at least one alert** | [`modules/monitoring`](infra/modules/monitoring): 8 alarms + backup events | ✅ |
 | D | **Least-privilege IAM, minimal ports, encryption** | [Security](#-security) | ✅ |
 | E | README: **local + cloud run, decisions, trade-offs** | this file | ✅ |
-| E | **Architecture diagram** | [Architecture](#-architecture) | ✅ |
+| E | **Architecture diagram** | [Architecture](#-architecture) + [12 detailed, zoomable diagrams](#diagrams) | ✅ |
 | E | **Production changes** (≤ ½ page) | [Production](#-how-this-changes-for-real-production) | ✅ |
 | ➕ | *Bonus:* SonarQube, Trivy, Checkov, gitleaks, tflint, hadolint | pipeline `lint` / `test` / `scan` stages | ⭐ |
 | ➕ | *Bonus:* HA/scaling toggles, WAF, autoscaling + load test | [`envs/prod`](infra/envs/prod/terraform.tfvars), [`load-test.js`](scripts/load-test.js) | ⭐ |
@@ -215,6 +215,146 @@ sequenceDiagram
 
 The naming isn't just cosmetic: **IAM permissions are scoped by these prefixes**. The CI deploy role can
 manage `guestbook-dev-*` and `guestbook-prod-*` but can never touch `guestbook-ci-*`, its own identity.
+
+---
+
+<a id="diagrams"></a>
+
+## 🗺️ Detailed diagrams
+
+> [!TIP]
+> **Click any diagram to open it full size.** Use **🔍 Zoom (SVG)** for a vector version that stays sharp at any
+> zoom level (Ctrl + mouse wheel in the browser). Sources are plain-text Mermaid in
+> [`docs/diagrams/*.mmd`](docs/diagrams), so they can be reviewed and changed like code.
+
+| # | Diagram | # | Diagram |
+|:-:|---|:-:|---|
+| 01 | [Full AWS architecture](#d01) | 07 | [CI/CD pipeline: 10 stages, 16 jobs](#d07) |
+| 02 | [Network: subnets, routing and gateways](#d02) | 08 | [Zero-downtime deploy and the two rollback layers](#d08) |
+| 03 | [Security-group chain (least-privilege ports)](#d03) | 09 | [Monitoring, logging and alerting](#d09) |
+| 04 | [IAM and secrets: who can do what](#d04) | 10 | [Backups and disaster recovery (four layers)](#d10) |
+| 05 | [Request lifecycle](#d05) | 11 | [Restore drill: proving backups actually work](#d11) |
+| 06 | [Terraform structure and module dependencies](#d06) | 12 | [dev vs prod: same code, different values](#d12) |
+
+<a id="d01"></a>
+
+### 01 · Full AWS architecture
+
+Every component of the dev environment and how they connect. Users only reach CloudFront: `/*` is served from a private S3 bucket through Origin Access Control, and `/api/*` goes through a CloudFront **VPC origin** to an **internal** ALB, so nothing in the VPC is reachable from the internet. Fargate tasks talk to RDS over TLS, pull images from ECR, get the DB password from Secrets Manager at start-up and ship JSON logs to CloudWatch. Alarms and backup failures go to an encrypted SNS topic. GitLab CI builds the image, pushes it to ECR and Docker Hub, and applies Terraform with state in a locked S3 bucket.
+
+[![Full AWS architecture](docs/diagrams/rendered/01-aws-architecture.png)](docs/diagrams/rendered/01-aws-architecture.svg)
+
+<sub>🔍 <a href="docs/diagrams/rendered/01-aws-architecture.svg"><b>Zoom (SVG)</b></a> · 🖼️ <a href="docs/diagrams/rendered/01-aws-architecture.png">PNG (high-res)</a> · ✏️ <a href="docs/diagrams/01-aws-architecture.mmd">Mermaid source</a> · <a href="#diagrams">↑ back to list</a></sub>
+
+<a id="d02"></a>
+
+### 02 · Network: subnets, routing and gateways
+
+VPC 10.20.0.0/16 across two AZs with three subnet tiers per AZ (/20 each). **Public** subnets route 0.0.0.0/0 to the internet gateway. **Private** subnets hold the internal ALB, with one route table per AZ so prod NAT traffic stays in-zone. **Data** subnets have only the local route, so the database has no path to the internet at all. A free S3 gateway endpoint keeps ECR image layers on the AWS network, VPC flow logs record rejected traffic, and the default security group is stripped of all rules.
+
+[![Network: subnets, routing and gateways](docs/diagrams/rendered/02-network.png)](docs/diagrams/rendered/02-network.svg)
+
+<sub>🔍 <a href="docs/diagrams/rendered/02-network.svg"><b>Zoom (SVG)</b></a> · 🖼️ <a href="docs/diagrams/rendered/02-network.png">PNG (high-res)</a> · ✏️ <a href="docs/diagrams/02-network.mmd">Mermaid source</a> · <a href="#diagrams">↑ back to list</a></sub>
+
+<a id="d03"></a>
+
+### 03 · Security-group chain (least-privilege ports)
+
+Each tier accepts traffic only from the tier in front of it, referenced by **security-group ID**, never by CIDR. The ALB accepts port 80 only from CloudFront's managed origin-facing prefix list. App tasks accept 8000 only from the ALB SG. The database accepts 5432 only from the app SG and has **no egress**. Anything else is dropped, and the ALB has no public IP to begin with.
+
+[![Security-group chain (least-privilege ports)](docs/diagrams/rendered/03-security-groups.png)](docs/diagrams/rendered/03-security-groups.svg)
+
+<sub>🔍 <a href="docs/diagrams/rendered/03-security-groups.svg"><b>Zoom (SVG)</b></a> · 🖼️ <a href="docs/diagrams/rendered/03-security-groups.png">PNG (high-res)</a> · ✏️ <a href="docs/diagrams/03-security-groups.mmd">Mermaid source</a> · <a href="#diagrams">↑ back to list</a></sub>
+
+<a id="d04"></a>
+
+### 04 · IAM and secrets: who can do what
+
+**CI:** two IAM users whose only permission is **sts:AssumeRole** on one role each (1-hour sessions). The deploy key is a **protected** GitLab variable, so only pipelines on main can use it. The deploy role is scoped by service, region and name prefix, with an explicit deny on editing CI identities. **Runtime:** the ECS execution role can read exactly one secret and decrypt with one key. The task role has **no permissions**. The DB password is generated and rotated by RDS and injected at container start, so it's never in code, CI, logs or Terraform state.
+
+[![IAM and secrets: who can do what](docs/diagrams/rendered/04-iam-secrets.png)](docs/diagrams/rendered/04-iam-secrets.svg)
+
+<sub>🔍 <a href="docs/diagrams/rendered/04-iam-secrets.svg"><b>Zoom (SVG)</b></a> · 🖼️ <a href="docs/diagrams/rendered/04-iam-secrets.png">PNG (high-res)</a> · ✏️ <a href="docs/diagrams/04-iam-secrets.mmd">Mermaid source</a> · <a href="#diagrams">↑ back to list</a></sub>
+
+<a id="d05"></a>
+
+### 05 · Request lifecycle
+
+What happens when a user loads the page and posts a message: HTTP→HTTPS redirect, edge caching, the SigV4-signed S3 read via OAC, the **X-Origin-Verify** header check on the ALB (default action 403), pydantic input validation, a parameterized INSERT over TLS, and security headers on every response.
+
+[![Request lifecycle](docs/diagrams/rendered/05-request-flow.png)](docs/diagrams/rendered/05-request-flow.svg)
+
+<sub>🔍 <a href="docs/diagrams/rendered/05-request-flow.svg"><b>Zoom (SVG)</b></a> · 🖼️ <a href="docs/diagrams/rendered/05-request-flow.png">PNG (high-res)</a> · ✏️ <a href="docs/diagrams/05-request-flow.mmd">Mermaid source</a> · <a href="#diagrams">↑ back to list</a></sub>
+
+<a id="d06"></a>
+
+### 06 · Terraform structure and module dependencies
+
+**bootstrap** is applied once: the state bucket, the shared ECR repository and the CI identities. **stack** is the single composition root that wires 8 reusable modules together. **envs/dev** and **envs/prod** contain only values (tfvars and a backend key), so the two environments can't drift in code. Arrows show which outputs feed which module.
+
+[![Terraform structure and module dependencies](docs/diagrams/rendered/06-terraform-modules.png)](docs/diagrams/rendered/06-terraform-modules.svg)
+
+<sub>🔍 <a href="docs/diagrams/rendered/06-terraform-modules.svg"><b>Zoom (SVG)</b></a> · 🖼️ <a href="docs/diagrams/rendered/06-terraform-modules.png">PNG (high-res)</a> · ✏️ <a href="docs/diagrams/06-terraform-modules.mmd">Mermaid source</a> · <a href="#diagrams">↑ back to list</a></sub>
+
+<a id="d07"></a>
+
+### 07 · CI/CD pipeline: 10 stages, 16 jobs
+
+lint (ruff, hadolint, fmt/validate, tflint, Checkov, gitleaks) → test (pytest + SonarQube quality gate) → build the image **once** → Trivy gate on fixable HIGH/CRITICAL **before** any push → publish to ECR and Docker Hub → plan with a **read-only** role → apply the saved plan to dev → smoke test → automatic rollback on failure → **manual** promotion of the same image to prod.
+
+[![CI/CD pipeline: 10 stages, 16 jobs](docs/diagrams/rendered/07-cicd-pipeline.png)](docs/diagrams/rendered/07-cicd-pipeline.svg)
+
+<sub>🔍 <a href="docs/diagrams/rendered/07-cicd-pipeline.svg"><b>Zoom (SVG)</b></a> · 🖼️ <a href="docs/diagrams/rendered/07-cicd-pipeline.png">PNG (high-res)</a> · ✏️ <a href="docs/diagrams/07-cicd-pipeline.mmd">Mermaid source</a> · <a href="#diagrams">↑ back to list</a></sub>
+
+<a id="d08"></a>
+
+### 08 · Zero-downtime deploy and the two rollback layers
+
+ECS rolling update with 100 % minimum healthy: the old task keeps serving until the new one passes health checks. If the new version **crashes**, the ECS deployment circuit breaker rolls back by itself. If it **runs but behaves wrong**, the smoke test fails and the rollback job restores the task definition recorded just before the deploy.
+
+[![Zero-downtime deploy and the two rollback layers](docs/diagrams/rendered/08-deploy-rollback.png)](docs/diagrams/rendered/08-deploy-rollback.svg)
+
+<sub>🔍 <a href="docs/diagrams/rendered/08-deploy-rollback.svg"><b>Zoom (SVG)</b></a> · 🖼️ <a href="docs/diagrams/rendered/08-deploy-rollback.png">PNG (high-res)</a> · ✏️ <a href="docs/diagrams/08-deploy-rollback.mmd">Mermaid source</a> · <a href="#diagrams">↑ back to list</a></sub>
+
+<a id="d09"></a>
+
+### 09 · Monitoring, logging and alerting
+
+Sources: structured JSON app logs, ALB, ECS and RDS metrics, RDS logs, VPC flow logs and AWS Backup events. A metric filter turns ERROR log lines into a metric. There are 8 CloudWatch alarms plus an EventBridge rule for backup failures, all going to an encrypted SNS topic and email. A dashboard defined in Terraform shows traffic, errors, latency, saturation and recent errors. The same metrics drive target-tracking autoscaling.
+
+[![Monitoring, logging and alerting](docs/diagrams/rendered/09-monitoring.png)](docs/diagrams/rendered/09-monitoring.svg)
+
+<sub>🔍 <a href="docs/diagrams/rendered/09-monitoring.svg"><b>Zoom (SVG)</b></a> · 🖼️ <a href="docs/diagrams/rendered/09-monitoring.png">PNG (high-res)</a> · ✏️ <a href="docs/diagrams/09-monitoring.mmd">Mermaid source</a> · <a href="#diagrams">↑ back to list</a></sub>
+
+<a id="d10"></a>
+
+### 10 · Backups and disaster recovery (four layers)
+
+1) RDS automated backups with point-in-time recovery. 2) An AWS Backup plan (daily, weekly in prod) into a vault with its **own** KMS key, selected by tag. 3) In prod, a cross-region copy and a **vault lock** in compliance mode (ransomware protection). 4) S3 versioning on the frontend and state buckets. Failed or aborted backup jobs raise an email alert.
+
+[![Backups and disaster recovery (four layers)](docs/diagrams/rendered/10-backup-dr.png)](docs/diagrams/rendered/10-backup-dr.svg)
+
+<sub>🔍 <a href="docs/diagrams/rendered/10-backup-dr.svg"><b>Zoom (SVG)</b></a> · 🖼️ <a href="docs/diagrams/rendered/10-backup-dr.png">PNG (high-res)</a> · ✏️ <a href="docs/diagrams/10-backup-dr.mmd">Mermaid source</a> · <a href="#diagrams">↑ back to list</a></sub>
+
+<a id="d11"></a>
+
+### 11 · Restore drill: proving backups actually work
+
+scripts/restore-drill.sh writes marker A, records time T, writes marker B, restores the database **to time T as a new instance**, then queries the copy from inside the VPC with a one-off ECS task. PASS means A is present and B is absent, so the restore landed on the exact second requested. It reports the measured RTO and always deletes the copy.
+
+[![Restore drill: proving backups actually work](docs/diagrams/rendered/11-restore-drill.png)](docs/diagrams/rendered/11-restore-drill.svg)
+
+<sub>🔍 <a href="docs/diagrams/rendered/11-restore-drill.svg"><b>Zoom (SVG)</b></a> · 🖼️ <a href="docs/diagrams/rendered/11-restore-drill.png">PNG (high-res)</a> · ✏️ <a href="docs/diagrams/11-restore-drill.mmd">Mermaid source</a> · <a href="#diagrams">↑ back to list</a></sub>
+
+<a id="d12"></a>
+
+### 12 · dev vs prod: same code, different values
+
+dev (deployed, about $1.70/day): 2 AZs, no NAT, 1–3 small tasks, single-AZ micro database, no WAF. prod (defined as code, manual promotion, about $8–10/day): 3 AZs, NAT per AZ with private tasks, 2–10 larger tasks, Multi-AZ database with deletion protection, WAF, 14/90-day backups, cross-region copy and vault lock.
+
+[![dev vs prod: same code, different values](docs/diagrams/rendered/12-dev-vs-prod.png)](docs/diagrams/rendered/12-dev-vs-prod.svg)
+
+<sub>🔍 <a href="docs/diagrams/rendered/12-dev-vs-prod.svg"><b>Zoom (SVG)</b></a> · 🖼️ <a href="docs/diagrams/rendered/12-dev-vs-prod.png">PNG (high-res)</a> · ✏️ <a href="docs/diagrams/12-dev-vs-prod.mmd">Mermaid source</a> · <a href="#diagrams">↑ back to list</a></sub>
 
 ---
 

@@ -1,0 +1,40 @@
+flowchart TB
+    classDef pub fill:#DCFCE7,stroke:#16A34A,color:#052e16
+    classDef priv fill:#DBEAFE,stroke:#2563EB,color:#0B2545
+    classDef data fill:#EDE9FE,stroke:#7C3AED,color:#2E1065
+    classDef rt fill:#FEF3C7,stroke:#D97706,color:#451A03
+    classDef gw fill:#F3F4F6,stroke:#374151,color:#111
+
+    INET(("Internet")):::gw
+
+    subgraph VPC["VPC 10.20.0.0/16 · DNS hostnames on · default SG has NO rules"]
+        IGW["Internet gateway<br/>guestbook-dev-igw"]:::gw
+        NAT["NAT gateway(s)<br/>dev: none · prod: one per AZ"]:::gw
+        S3EP["S3 gateway endpoint (free)"]:::gw
+
+        RTPUB["Route table: public-rt<br/>10.20.0.0/16 → local<br/>0.0.0.0/0 → IGW<br/>S3 prefix list → endpoint"]:::rt
+        RTPRI["Route tables: private-rt-a / -b (one per AZ)<br/>10.20.0.0/16 → local<br/>0.0.0.0/0 → NAT in the same AZ (prod only)<br/>S3 prefix list → endpoint"]:::rt
+        RTDATA["Route table: data-rt<br/>10.20.0.0/16 → local<br/>(nothing else, fully isolated)"]:::rt
+
+        subgraph A["Availability zone eu-north-1a"]
+            PA["public-eu-north-1a<br/>10.20.0.0/20 · 4,091 IPs<br/>dev: Fargate tasks (public IP, egress only)<br/>prod: NAT gateway"]:::pub
+            RA["private-eu-north-1a<br/>10.20.64.0/20<br/>internal ALB node<br/>prod: Fargate tasks"]:::priv
+            DA["data-eu-north-1a<br/>10.20.128.0/20<br/>RDS primary"]:::data
+        end
+        subgraph B["Availability zone eu-north-1b"]
+            PB["public-eu-north-1b<br/>10.20.16.0/20"]:::pub
+            RB["private-eu-north-1b<br/>10.20.80.0/20<br/>internal ALB node"]:::priv
+            DB["data-eu-north-1b<br/>10.20.144.0/20<br/>RDS standby (prod Multi-AZ)"]:::data
+        end
+
+        FL["VPC flow logs → /guestbook-dev/vpc-flow-logs<br/>traffic_type = REJECT · 7-day retention · KMS"]:::gw
+    end
+
+    INET <--> IGW
+    IGW --- RTPUB
+    RTPUB --- PA & PB
+    RTPRI --- RA & RB
+    RTDATA --- DA & DB
+    NAT -.-> RTPRI
+    S3EP -.-> RTPUB & RTPRI
+    VPC -.-> FL

@@ -1,0 +1,41 @@
+flowchart LR
+    classDef db fill:#3B48CC,stroke:#232C80,color:#fff
+    classDef bk fill:#DCFCE7,stroke:#16A34A,color:#052e16
+    classDef k fill:#FEE2E2,stroke:#DC2626,color:#450A0A
+    classDef prod fill:#111827,stroke:#111827,color:#fff
+    classDef s3 fill:#FEF3C7,stroke:#D97706,color:#451A03
+
+    RDS[("RDS guestbook-dev-postgres<br/>tags: backup=true, Environment=dev")]:::db
+
+    subgraph NATIVE["Layer 1 · RDS native"]
+        AUTO["Automated backups<br/>daily snapshot 01:00-01:30 UTC<br/>+ transaction logs every ~5 min"]:::bk
+        PITR["Point-in-time recovery<br/>any second in the window<br/>dev 1 day (Free plan) · prod 14 days"]:::bk
+    end
+
+    subgraph AWSB["Layer 2 · AWS Backup (eu-north-1)"]
+        PLAN["Plan guestbook-dev-plan<br/>daily cron(0 2 * * ? *) → 7 d (prod 14 d)<br/>weekly cron(0 3 ? * SUN *) → prod 90 d"]:::bk
+        SEL["Selection: tag backup=true<br/>AND Environment=&lt;env&gt;"]:::bk
+        VAULT[("Vault guestbook-dev-vault")]:::bk
+        BKEY["KMS alias/guestbook-dev-backup<br/>separate from the data key"]:::k
+        LOCK["Vault lock, compliance mode (prod)<br/>no early deletion, even by admin"]:::prod
+    end
+
+    subgraph DR["Layer 3 · DR region (prod)"]
+        DRV[("Vault guestbook-prod-vault-dr<br/>copy of every recovery point<br/>own KMS key")]:::prod
+    end
+
+    subgraph S3V["Layer 4 · S3 versioning"]
+        FE["frontend bucket<br/>30 days of old versions"]:::s3
+        ST["tfstate bucket<br/>90 days of old versions"]:::s3
+    end
+
+    ALERT["EventBridge → SNS → email<br/>on FAILED / ABORTED / EXPIRED"]:::k
+
+    RDS --> AUTO --> PITR
+    SEL --> RDS
+    PLAN --> SEL
+    RDS -->|snapshot| VAULT
+    BKEY -.- VAULT
+    LOCK -.- VAULT
+    VAULT -->|copy_action| DRV
+    VAULT -.->|job events| ALERT

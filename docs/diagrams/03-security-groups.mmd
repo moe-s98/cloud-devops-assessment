@@ -1,0 +1,33 @@
+flowchart LR
+    classDef sg fill:#FEE2E2,stroke:#DC2626,color:#450A0A
+    classDef src fill:#F3F4F6,stroke:#6B7280,color:#111
+    classDef deny fill:#111827,stroke:#111827,color:#fff
+
+    CFPL["Managed prefix list<br/>com.amazonaws.global.cloudfront.origin-facing<br/>(CloudFront edge servers only)"]:::src
+    ANY(["Anyone else on the internet"]):::src
+    AWSAPI["AWS APIs over HTTPS<br/>ECR · Secrets Manager · CloudWatch Logs"]:::src
+
+    subgraph ALBSG["SG guestbook-dev-alb"]
+        A_IN["INGRESS tcp/80 ← CloudFront prefix list"]
+        A_OUT["EGRESS tcp/8000 → SG app"]
+    end
+    subgraph APPSG["SG guestbook-dev-app"]
+        P_IN["INGRESS tcp/8000 ← SG alb"]
+        P_OUT1["EGRESS tcp/5432 → SG db"]
+        P_OUT2["EGRESS tcp/443 → 0.0.0.0/0"]
+    end
+    subgraph DBSG["SG guestbook-dev-db"]
+        D_IN["INGRESS tcp/5432 ← SG app"]
+        D_OUT["EGRESS: none<br/>(the database never initiates connections)"]
+    end
+    DEF["Default SG<br/>all rules removed"]:::deny
+
+    CFPL -->|":80"| A_IN
+    A_OUT -->|":8000"| P_IN
+    P_OUT1 -->|":5432 TLS"| D_IN
+    P_OUT2 --> AWSAPI
+    ANY -.->|"x no rule matches: dropped<br/>(and the ALB has no public IP)"| A_IN
+    ANY -.->|"x dropped"| P_IN
+    ANY -.->|"x dropped (no route either)"| D_IN
+
+    class ALBSG,APPSG,DBSG sg

@@ -1,0 +1,29 @@
+flowchart TB
+    classDef dev fill:#DBEAFE,stroke:#2563EB,color:#0B2545
+    classDef prod fill:#FEE2E2,stroke:#DC2626,color:#450A0A
+    classDef code fill:#7B42BC,stroke:#4C1D95,color:#fff
+
+    CODE["Same code: infra/stack + infra/modules<br/>the same image digest promoted from dev"]:::code
+
+    subgraph DEV["dev · envs/dev/terraform.tfvars · ≈ $1.70/day · DEPLOYED"]
+        direction TB
+        D1["2 AZs · VPC 10.20.0.0/16"]:::dev
+        D2["nat_gateway_mode = none<br/>tasks in public subnets, public IP for egress only<br/>SG still admits ALB only"]:::dev
+        D3["ECS 1 → 3 tasks · 0.25 vCPU / 0.5 GB"]:::dev
+        D4["RDS db.t4g.micro single-AZ<br/>PITR 1 day · no deletion protection"]:::dev
+        D5["CloudFront · no WAF"]:::dev
+        D6["Backup daily 7 d · no DR copy · no lock"]:::dev
+    end
+
+    subgraph PROD["prod · envs/prod/terraform.tfvars · ≈ $8-10/day · MANUAL, defined not running"]
+        direction TB
+        P1["3 AZs · VPC 10.30.0.0/16"]:::prod
+        P2["nat_gateway_mode = per_az<br/>tasks in private subnets, no public IP"]:::prod
+        P3["ECS 2 → 10 tasks · 0.5 vCPU / 1 GB<br/>Container Insights on"]:::prod
+        P4["RDS db.t4g.medium Multi-AZ<br/>PITR 14 d · storage autoscaling 100 GB<br/>Performance Insights · deletion protection · final snapshot"]:::prod
+        P5["CloudFront + WAF<br/>rate limit · CommonRuleSet · KnownBadInputs"]:::prod
+        P6["Backup daily 14 d + weekly 90 d<br/>cross-region copy · vault lock"]:::prod
+    end
+
+    CODE --> DEV
+    CODE -->|"deploy:prod approval"| PROD

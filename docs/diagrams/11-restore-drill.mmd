@@ -1,0 +1,30 @@
+sequenceDiagram
+    autonumber
+    participant OP as restore-drill.sh
+    participant API as Public API (CloudFront)
+    participant SRC as RDS guestbook-dev-postgres
+    participant CPY as RDS …-postgres-drill-HHMM (new)
+    participant T as One-off ECS task (same image + network)
+    participant CW as CloudWatch Logs
+
+    OP->>API: POST marker A
+    Note over OP: T = now (UTC)
+    OP->>API: POST marker B (must NOT survive the restore)
+    loop until LatestRestorableTime > T
+        OP->>SRC: describe-db-instances
+    end
+    OP->>SRC: restore-db-instance-to-point-in-time(restore-time = T)
+    SRC-->>CPY: new instance, same subnet group + SG, not public
+    Note over OP,CPY: RTO timer running
+    OP->>CPY: wait db-instance-available
+    Note over OP: RTO = elapsed seconds
+    OP->>T: run-task with overrides: DB_HOST = copy, command = count(A), count(B)
+    T->>CPY: SELECT over TLS from inside the VPC
+    T->>CW: print DRILL_RESULT A=1 B=0
+    OP->>CW: get-log-events
+    alt A=1 and B=0
+        Note over OP: PASS · restored to the exact second · report RTO
+    else anything else
+        Note over OP: FAIL
+    end
+    OP->>CPY: delete-db-instance (trap on EXIT, always cleans up)

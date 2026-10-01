@@ -1,0 +1,85 @@
+flowchart TB
+    classDef edge fill:#8C4FFF,stroke:#5A2DB5,color:#fff
+    classDef net fill:#E7F0FD,stroke:#3B82F6,color:#0B2545
+    classDef compute fill:#FF9900,stroke:#B36B00,color:#111
+    classDef data fill:#3B48CC,stroke:#232C80,color:#fff
+    classDef sec fill:#DD344C,stroke:#99192C,color:#fff
+    classDef ops fill:#E7157B,stroke:#9C0E53,color:#fff
+    classDef store fill:#7AA116,stroke:#4E6A0D,color:#fff
+    classDef ext fill:#F3F4F6,stroke:#6B7280,color:#111
+
+    user(["User browser"]):::ext
+    devs(["Developer: git push"]):::ext
+
+    subgraph GLOBAL["Global / us-east-1"]
+        CF["CloudFront distribution<br/>HTTPS only · HTTP→301 · HTTP/2+3<br/>Managed-SecurityHeadersPolicy (HSTS, nosniff, XFO)<br/>PriceClass_100"]:::edge
+        WAF["AWS WAFv2 (prod)<br/>rate limit / IP · CommonRuleSet<br/>KnownBadInputs (Log4j)"]:::sec
+        OAC["Origin Access Control<br/>SigV4-signed S3 reads"]:::sec
+        VPCO["CloudFront VPC origin<br/>private connection into the VPC"]:::edge
+    end
+
+    subgraph REGION["AWS region eu-north-1 (Stockholm) · account 6835…1720"]
+        S3F[("S3 guestbook-dev-frontend-*<br/>private · BPA on · versioned<br/>SSE-S3 · TLS-only policy")]:::store
+
+        subgraph VPC["VPC guestbook-dev-vpc · 10.20.0.0/16"]
+            IGW["Internet gateway"]:::net
+            S3EP["S3 gateway endpoint<br/>(ECR layers stay on AWS network)"]:::net
+            FLOW["VPC flow logs (REJECT)<br/>→ CloudWatch, KMS"]:::ops
+
+            subgraph AZA["eu-north-1a"]
+                PUBA["public 10.20.0.0/20"]:::net
+                PRIA["private 10.20.64.0/20"]:::net
+                DATA_A["data 10.20.128.0/20<br/>no internet route"]:::net
+            end
+            subgraph AZB["eu-north-1b"]
+                PUBB["public 10.20.16.0/20"]:::net
+                PRIB["private 10.20.80.0/20"]:::net
+                DATA_B["data 10.20.144.0/20<br/>no internet route"]:::net
+            end
+
+            ALB["Internal ALB guestbook-dev-alb<br/>listener :80 → default 403<br/>rule: X-Origin-Verify == secret → forward<br/>drop_invalid_header_fields"]:::compute
+            ECS["ECS Fargate service guestbook-dev-api<br/>task 0.25 vCPU / 0.5 GB · UID 10001<br/>read-only rootfs · caps dropped<br/>rolling 100/200 % · circuit breaker + rollback<br/>autoscaling 1-3 (CPU 60 %, 500 req/task)"]:::compute
+            RDS[("RDS PostgreSQL 16 · db.t4g.micro<br/>guestbook-dev-postgres<br/>KMS-encrypted gp3 · force_ssl=1<br/>not public · PITR · IAM auth")]:::data
+        end
+
+        ECR[("ECR guestbook-api<br/>IMMUTABLE tags · scan on push · KMS")]:::store
+        SM["Secrets Manager<br/>RDS-managed master secret<br/>(auto-rotated, KMS)"]:::sec
+        KMS["KMS alias/guestbook-dev-main<br/>(RDS, secret, logs, SNS) · rotation on"]:::sec
+        KMSB["KMS alias/guestbook-dev-backup<br/>(backup vault only)"]:::sec
+        CW["CloudWatch<br/>log groups · 8 alarms · metric filter<br/>dashboard guestbook-dev-overview"]:::ops
+        EB["EventBridge<br/>Backup job FAILED/ABORTED/EXPIRED"]:::ops
+        SNS["SNS guestbook-dev-alerts<br/>KMS-encrypted"]:::ops
+        BK[("AWS Backup vault guestbook-dev-vault<br/>daily plan · tag backup=true")]:::store
+        TFS[("S3 guestbook-tfstate-*<br/>Terraform state · versioned<br/>KMS · native lock file")]:::store
+    end
+
+    MAIL(["Alert email"]):::ext
+    GL["GitLab CI (self-hosted)<br/>assume-role keys → 1 h sessions"]:::ext
+    DH[("Docker Hub moes98/test2026<br/>public showcase")]:::ext
+
+    user -->|"HTTPS 443"| CF
+    WAF -.-> CF
+    CF -->|"/* (cached)"| OAC --> S3F
+    CF ==>|"/api/* (no cache)<br/>+ X-Origin-Verify"| VPCO ==>|"HTTP :80 private"| ALB
+    ALB -->|":8000 SG→SG"| ECS
+    ECS -->|":5432 TLS SG→SG"| RDS
+    ECS -. "pull image (HTTPS)" .-> ECR
+    ECS -. "DB password at task start" .-> SM
+    ECS -. "JSON logs (awslogs)" .-> CW
+    ECS -. "egress via public IP<br/>(dev: no NAT)" .-> IGW
+    RDS -. "postgres logs" .-> CW
+    RDS -. "snapshots" .-> BK
+    KMS -.- RDS
+    KMS -.- SM
+    KMSB -.- BK
+    ALB -.-|"nodes in"| PRIA & PRIB
+    ECS -.-|"tasks in (dev)"| PUBA & PUBB
+    RDS -.-|"primary in"| DATA_A
+    CW -->|alarm| SNS
+    BK -.-> EB --> SNS
+    SNS --> MAIL
+    devs --> GL
+    GL -->|"push :sha"| ECR
+    GL -->|"push :sha, :latest"| DH
+    GL -->|"plan / apply"| TFS
+    GL -->|"s3 sync + invalidate"| S3F

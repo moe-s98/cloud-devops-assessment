@@ -1,0 +1,48 @@
+flowchart TB
+    classDef root fill:#7B42BC,stroke:#4C1D95,color:#fff
+    classDef mod fill:#EDE9FE,stroke:#7C3AED,color:#2E1065
+    classDef cfg fill:#FEF3C7,stroke:#D97706,color:#451A03
+    classDef boot fill:#DCFCE7,stroke:#16A34A,color:#052e16
+    classDef st fill:#F3F4F6,stroke:#6B7280,color:#111
+
+    subgraph BOOT["infra/bootstrap (applied once · local state)"]
+        B1["aws_s3_bucket.tfstate<br/>versioned · KMS · TLS-only"]:::boot
+        B2["aws_ecr_repository.api<br/>immutable · scan on push"]:::boot
+        B3["CI users + roles + policies<br/>plan / deploy"]:::boot
+    end
+
+    subgraph ENVS["infra/envs (values only)"]
+        DEVV["dev/terraform.tfvars<br/>dev/backend.hcl → key envs/dev/…"]:::cfg
+        PRDV["prod/terraform.tfvars<br/>prod/backend.hcl → key envs/prod/…"]:::cfg
+    end
+
+    STACK["infra/stack (composition root)<br/>providers: aws · aws.us_east_1 · aws.copy_region · random<br/>default_tags: Project Environment Owner ManagedBy Repository CostCenter<br/>random_password.origin_verify · data.aws_ecr_repository"]:::root
+
+    KMS["module kms<br/>CMK + alias + key policy"]:::mod
+    NET["module network<br/>VPC · 3 tiers × AZs · RTs · NAT toggle<br/>S3 endpoint · flow logs"]:::mod
+    SEC["module security<br/>SG alb / app / db + rules"]:::mod
+    DBM["module database<br/>subnet group · param group · RDS"]:::mod
+    COMP["module compute<br/>cluster · log group · IAM · task def<br/>internal ALB · TG · listener · service · autoscaling"]:::mod
+    CDN["module cdn<br/>S3 · OAC · VPC origin · distribution · WAF"]:::mod
+    MON["module monitoring<br/>SNS · alarms · metric filter · EventBridge · dashboard"]:::mod
+    BAK["module backup<br/>KMS · vault · lock · plan · selection · DR vault"]:::mod
+
+    STATE[("S3 state<br/>envs/dev/terraform.tfstate<br/>envs/prod/terraform.tfstate")]:::st
+
+    B1 -.->|stores| STATE
+    B2 -.->|"data source: repository_url"| STACK
+    DEVV & PRDV -->|"-var-file / -backend-config"| STACK
+    STACK --> KMS & NET
+    NET -->|vpc_id| SEC
+    KMS -->|key_arn| NET & DBM & COMP & MON
+    NET -->|data_subnet_ids| DBM
+    SEC -->|db_sg_id| DBM
+    NET -->|"private/public subnet ids, has_nat"| COMP
+    SEC -->|"alb_sg_id, app_sg_id"| COMP
+    DBM -->|"address, port, secret_arn"| COMP
+    COMP -->|"alb_arn, alb_dns_name"| CDN
+    COMP -->|"alb/tg suffix, cluster, service, log group"| MON
+    DBM -->|instance_id| MON
+    STACK --> BAK
+    DBM -.->|"tag backup=true"| BAK
+    STACK -.-> STATE
