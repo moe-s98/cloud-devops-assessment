@@ -1135,7 +1135,7 @@ Screenshots from the live dev deployment. **Click any image to open it full size
 
 [![02-tests](docs/evidence/02-tests.png)](docs/evidence/02-tests.png)
 
-**03 · sonarqube**: SonarQube **quality gate: Passed**. 0 new issues, 0 security hotspots (rating A).
+**03 · sonarqube**: SonarQube **quality gate: Passed** (Overall Code): **coverage 78.9 %**, 0 security, reliability and maintainability issues (all **A**), 0 % duplication, 0 security hotspots.
 
 [![03-sonarqube](docs/evidence/03-sonarqube.png)](docs/evidence/03-sonarqube.png)
 
@@ -1198,6 +1198,16 @@ Screenshots from the live dev deployment. **Click any image to open it full size
 **10c · scaling event**: Service events: *"Successfully set desired count to 3 … Cause: monitor alarm TargetTracking-…-AlarmHigh in state ALARM triggered policy guestbook-dev-api-requests"*, then 2 tasks started, 2 targets registered and steady state reached.
 
 [![10c-scaling-event](docs/evidence/10c-scaling-event.png)](docs/evidence/10c-scaling-event.png)
+
+### Registry
+
+**12 · dockerhub**: the public image [`moes98/test2026`](https://hub.docker.com/r/moes98/test2026/tags), pushed by the pipeline. `latest` and the commit tag `eeb55e51` share **one digest** (`c109b8215de2`), the exact image that passed Trivy, at **33 MB compressed**.
+
+[![12-dockerhub](docs/evidence/12-dockerhub.png)](docs/evidence/12-dockerhub.png)
+
+```bash
+docker pull moes98/test2026:latest
+```
 
 ### Not included
 
